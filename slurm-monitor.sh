@@ -5,18 +5,18 @@ USER_NAME="${USER_NAME:-${USER:-unknown}}"
 LOG_DIR="${LOG_DIR:-}"
 FALLBACK_OUT_LOG="${FALLBACK_OUT_LOG:-}"
 FALLBACK_ERR_LOG="${FALLBACK_ERR_LOG:-}"
-LOG_REFRESH="${LOG_REFRESH:-2}"
+LOG_REFRESH="${LOG_REFRESH:-5}"
 SLURM_REFRESH="${SLURM_REFRESH:-30}"
 MODE="${MODE:-both}"                 # both | out | err | details | picker
 QUEUE_VISIBLE_ROWS="${QUEUE_VISIBLE_ROWS:-4}"
 
 # CLI:
-#   ./slurm-monitor-v4.sh [log_dir] [fallback_out] [fallback_err]
+#   ./slurm-monitor.sh [log_dir] [fallback_out] [fallback_err]
 #
 # Examples:
-#   ./slurm-monitor-v4.sh /work/ruhan625/logs
-#   ./slurm-monitor-v4.sh /work/ruhan625/logs /tmp/default.out /tmp/default.err
-#   LOG_DIR=/work/ruhan625/logs ./slurm-monitor-v4.sh
+#   ./slurm-monitor.sh /work/ruhan625/logs
+#   ./slurm-monitor.sh /work/ruhan625/logs /tmp/default.out /tmp/default.err
+#   LOG_DIR=/work/ruhan625/logs ./slurm-monitor.sh
 
 if (( $# >= 1 )); then
   if [[ -d "$1" ]]; then
@@ -107,12 +107,16 @@ term_size() {
 }
 
 hr() {
-  printf '%*s\n' "$COLS" '' | tr ' ' '-'
+  local width=$(( COLS > 1 ? COLS - 1 : 1 ))
+  printf '%*s' "$width" '' | tr ' ' '-'
+  tput el 2>/dev/null || true
+  printf '\n'
 }
 
 blank_lines() {
   local n="$1" i
   for ((i = 0; i < n; i++)); do
+    tput el 2>/dev/null || true
     printf '\n'
   done
 }
@@ -135,17 +139,88 @@ fit() {
   fi
 }
 
+strip_ansi() {
+  sed -E $'s/\x1B\\[[0-9;?]*[ -/]*[@-~]//g; s/\x1B[@-_]//g'
+}
+
+sanitize_line() {
+  local line="$1"
+
+  line="${line//$'\r'/}"
+  line="$(printf '%s' "$line" | strip_ansi)"
+  line="$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037\177')"
+
+  printf '%s' "$line"
+}
+
+print_row() {
+  local text width
+  width=$(( COLS > 1 ? COLS - 1 : 1 ))
+
+  printf -v text "$@"
+  text="$(sanitize_line "$text")"
+
+  printf '%s' "${text:0:$width}"
+  tput el 2>/dev/null || true
+  printf '\n'
+}
+
+print_last_row() {
+  local text width
+  width=$(( COLS > 1 ? COLS - 1 : 1 ))
+
+  printf -v text "$@"
+  text="$(sanitize_line "$text")"
+
+  printf '%s' "${text:0:$width}"
+  tput el 2>/dev/null || true
+}
+
+print_row_ansi() {
+  local text
+  printf -v text "$@"
+  printf '%s' "$text"
+  tput el 2>/dev/null || true
+  printf '\n'
+}
+
+print_prefix_row_ansi() {
+  local prefix_ansi="$1"
+  local prefix_plain="$2"
+  shift 2
+
+  local suffix width remaining
+  width=$(( COLS > 1 ? COLS - 1 : 1 ))
+
+  printf -v suffix "$@"
+  suffix="$(sanitize_line "$suffix")"
+
+  remaining=$(( width - ${#prefix_plain} ))
+  (( remaining < 0 )) && remaining=0
+
+  printf '%s%s%s' "$prefix_ansi" "$prefix_plain" "$RESET"
+  printf '%s' "${suffix:0:$remaining}"
+  tput el 2>/dev/null || true
+  printf '\n'
+}
+
 print_buffer() {
   local -n arr_ref="$1"
   local max_lines="$2"
-  local i line
+  local i line width
+
+  width=$(( COLS > 1 ? COLS - 1 : 1 ))
 
   for ((i = 0; i < max_lines; i++)); do
     if (( i < ${#arr_ref[@]} )); then
       line="${arr_ref[i]}"
       line="${line//$'\t'/    }"
-      printf "%s\n" "${line:0:$COLS}"
+      line="$(sanitize_line "$line")"
+      printf '%s' "${line:0:$width}"
+      tput el 2>/dev/null || true
+      printf '\n'
     else
+      tput el 2>/dev/null || true
       printf '\n'
     fi
   done
@@ -411,7 +486,6 @@ collect_log_candidates() {
 
   [[ -n "$jobid" ]] && root_jobid="${jobid%%_*}"
 
-  # Prefer already-known files first
   candidate_add "${USER_STDOUT_MAP[$jobid]:-}"
   candidate_add "${USER_STDERR_MAP[$jobid]:-}"
   candidate_add "${STDOUT_MAP[$jobid]:-}"
@@ -548,14 +622,21 @@ queue_total_lines() {
 
 draw_header() {
   local live_state
+  local user_disp selected_disp mode_disp
+
+  user_disp="$(fit 16 "$(sanitize_line "$USER_NAME")")"
+  selected_disp="$(fit 16 "$(sanitize_line "${SELECTED_JOBID:-none}")")"
+  mode_disp="$(fit 8 "$(sanitize_line "${MODE^^}")")"
+
   if (( PAUSED == 1 )); then
     live_state="${YELLOW}PAUSED${RESET}"
   else
     live_state="${GREEN}LIVE${RESET}"
   fi
 
-  printf "%sSlurm Monitor v4%s  user=%s%s%s  logs=%ss  slurm=%ss  mode=%s  selected=%s  status=%b\n" \
-    "$BOLD$CYAN" "$RESET" "$BOLD" "$USER_NAME" "$RESET" "$LOG_REFRESH" "$SLURM_REFRESH" "${MODE^^}" "${SELECTED_JOBID:-none}" "$live_state"
+  print_row_ansi "%sSlurm Monitor%s  user=%s  logs=%ss  slurm=%ss  mode=%s  selected=%s  status=%s" \
+    "$BOLD$CYAN" "$RESET" \
+    "$user_disp" "$LOG_REFRESH" "$SLURM_REFRESH" "$mode_disp" "$selected_disp" "$live_state"
 
   hr
 }
@@ -564,27 +645,27 @@ draw_queue_panel() {
   local total_lines="$1"
   local body_lines=$(( total_lines - 2 ))
   local id_w=8 state_w=12 time_w=10 nds_w=4 reason_w=26
-  local name_w=$(( COLS - 1 - 1 - id_w - 1 - state_w - 1 - time_w - 1 - nds_w - 1 - reason_w - 1 ))
+  local name_w=$(( COLS - 1 - 1 - id_w - 1 - state_w - 1 - time_w - 1 - nds_w - 1 - reason_w - 2 ))
   local start=0 max_start=0 visible idx
   local mark id state_plain state_colored time nodes reason name
 
   (( body_lines < 1 )) && body_lines=1
   (( name_w < 10 )) && name_w=10
 
-  printf "%sQueue%s  jobs=%s  visible=%s  last_slurm=%s\n" \
+  print_row_ansi "%sQueue%s  jobs=%s  visible=%s  last_slurm=%s" \
     "$BOLD$MAGENTA" "$RESET" "$JOB_COUNT" "$body_lines" "$LAST_SLURM_REFRESH"
 
-  printf "  %-8s %-12s %-10s %-4s %-26s %s\n" \
+  print_row "  %-8s %-12s %-10s %-4s %-26s %s" \
     "JOBID" "STATE" "TIME" "NDS" "NODE/REASON" "NAME"
 
   if [[ -n "$QUEUE_ERROR" ]]; then
-    printf "%s%s%s\n" "$RED" "$QUEUE_ERROR" "$RESET"
+    print_row "%s" "$QUEUE_ERROR"
     blank_lines $(( body_lines - 1 ))
     return
   fi
 
   if (( JOB_COUNT == 0 )); then
-    printf "%sNo jobs found for %s.%s\n" "$DIM" "$USER_NAME" "$RESET"
+    print_row "No jobs found for %s." "$USER_NAME"
     blank_lines $(( body_lines - 1 ))
     return
   fi
@@ -600,6 +681,7 @@ draw_queue_panel() {
     idx=$(( start + visible ))
 
     if (( idx >= JOB_COUNT )); then
+      tput el 2>/dev/null || true
       printf '\n'
       continue
     fi
@@ -614,12 +696,16 @@ draw_queue_panel() {
 
     if (( idx == SELECTED_INDEX )); then
       mark=">"
-      printf "%s%s %-8s %-12b %-10s %-4s %-26s %s%s\n" \
+      printf "%s%s %-8s %-12b %-10s %-4s %-26s %s%s" \
         "$REV" "$mark" "$id" "$state_colored" "$time" "$nodes" "$reason" "$name" "$RESET"
+      tput el 2>/dev/null || true
+      printf '\n'
     else
       mark=" "
-      printf "%s %-8s %-12b %-10s %-4s %-26s %s\n" \
+      printf "%s %-8s %-12b %-10s %-4s %-26s %s" \
         "$mark" "$id" "$state_colored" "$time" "$nodes" "$reason" "$name"
+      tput el 2>/dev/null || true
+      printf '\n'
     fi
   done
 }
@@ -628,7 +714,6 @@ draw_unresolved_message() {
   local stream="$1"
   local total_lines="$2"
   local buf=()
-  local show_n=0
   local i max_preview
 
   collect_log_candidates "$SELECTED_JOBID"
@@ -645,7 +730,7 @@ draw_unresolved_message() {
     done
   else
     buf+=("No LOG_DIR configured.")
-    buf+=("Start like: ./slurm-monitor-v4.sh /path/to/logs")
+    buf+=("Start like: ./slurm-monitor.sh /path/to/logs")
   fi
 
   print_buffer buf "$total_lines"
@@ -659,8 +744,8 @@ draw_file_block() {
   (( total_lines < 1 )) && return 0
   (( content_lines < 0 )) && content_lines=0
 
-  printf "%s[%s]%s %s\n" "$BOLD$color" "$title" "$RESET" "${file:-unresolved}"
-  printf "%sSelected:%s %s\n" "$DIM" "$RESET" "${SELECTED_JOBID:-none}"
+  print_prefix_row_ansi "$BOLD$color" "[${title}] " "%s" "${file:-unresolved}"
+  print_row "%sSelected:%s %s" "$DIM" "$RESET" "${SELECTED_JOBID:-none}"
 
   if (( content_lines == 0 )); then
     return 0
@@ -696,12 +781,12 @@ draw_details_block() {
   shown_in="${CURRENT_IN_LOG:-/dev/null}"
   shown_workdir="${CURRENT_WORKDIR:-unknown}"
 
-  printf "%s[DETAILS]%s selected job=%s\n" "$BOLD$BLUE" "$RESET" "${SELECTED_JOBID:-none}"
-  printf "StdOut : %s\n" "${shown_out:-unresolved}"
-  printf "StdErr : %s\n" "${shown_err:-unresolved}"
-  printf "StdIn  : %s\n" "${shown_in:-unresolved}"
-  printf "WorkDir: %s\n" "$shown_workdir"
-  printf "LOG_DIR: %s\n" "${LOG_DIR:-not set}"
+  print_prefix_row_ansi "$BOLD$BLUE" "[DETAILS] " "selected job=%s" "${SELECTED_JOBID:-none}"
+  print_row "StdOut : %s" "${shown_out:-unresolved}"
+  print_row "StdErr : %s" "${shown_err:-unresolved}"
+  print_row "StdIn  : %s" "${shown_in:-unresolved}"
+  print_row "WorkDir: %s" "$shown_workdir"
+  print_row "LOG_DIR: %s" "${LOG_DIR:-not set}"
 
   if (( content_lines == 0 )); then
     return 0
@@ -718,7 +803,6 @@ draw_picker_block() {
   local total_lines="$1"
   local body_lines=$(( total_lines - 4 ))
   local start=0 max_start=0 idx visible path current_out current_err
-  local title_w
 
   (( body_lines < 1 )) && body_lines=1
   collect_log_candidates "$SELECTED_JOBID"
@@ -726,14 +810,13 @@ draw_picker_block() {
   current_out="$(resolve_output_path out)"
   current_err="$(resolve_output_path err)"
 
-  printf "%s[LOG PICKER]%s job=%s  dir=%s\n" \
-    "$BOLD$YELLOW" "$RESET" "${SELECTED_JOBID:-none}" "${LOG_DIR:-not set}"
-  printf "stdout=%s\n" "${current_out:-unresolved}"
-  printf "stderr=%s\n" "${current_err:-unresolved}"
-  printf "Use Up/Down to move, o=assign stdout, e=assign stderr, a=auto, c=clear, Enter/Esc=l eave\n"
+  print_prefix_row_ansi "$BOLD$YELLOW" "[LOG PICKER] " "job=%s  dir=%s" "${SELECTED_JOBID:-none}" "${LOG_DIR:-not set}"
+  print_row "stdout=%s" "${current_out:-unresolved}"
+  print_row "stderr=%s" "${current_err:-unresolved}"
+  print_row "Use Up/Down, o=stdout, e=stderr, a=auto, c=clear, Enter/Esc/l=close"
 
   if (( ${#PICKER_FILES[@]} == 0 )); then
-    printf "%sNo candidates found.%s\n" "$DIM" "$RESET"
+    print_row "No candidates found."
     blank_lines $(( body_lines - 1 ))
     return
   fi
@@ -748,15 +831,16 @@ draw_picker_block() {
   for ((visible = 0; visible < body_lines; visible++)); do
     idx=$(( start + visible ))
     if (( idx >= ${#PICKER_FILES[@]} )); then
+      tput el 2>/dev/null || true
       printf '\n'
       continue
     fi
 
     path="${PICKER_FILES[idx]}"
     if (( idx == PICKER_INDEX )); then
-      printf "%s> %s%s\n" "$REV" "$(fit $((COLS - 2)) "$path")" "$RESET"
+      print_row "> %s" "$path"
     else
-      printf "  %s\n" "$(fit $((COLS - 2)) "$path")"
+      print_row "  %s" "$path"
     fi
   done
 }
@@ -796,44 +880,27 @@ draw_bottom_panel() {
 
 draw_footer() {
   hr
+
   if [[ "$MODE" == "picker" ]]; then
-    printf "Keys: %sUp/Down%s files | %so%s set stdout | %se%s set stderr | %sa%s auto | %sc%s clear manual | %sEnter/Esc/l%s close picker | %sR%s force Slurm | %sq%s quit\n" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET"
+    print_row "Keys: Up/Down files | o stdout | e stderr | a auto | c clear | Enter/Esc/l close | R refresh | q quit"
   else
-    printf "Keys: %sUp/Down%s select job | %sEnter%s details | %sTab%s cycle | %s1/2/3/4%s views | %sl%s picker | %sp%s pause | %sr%s redraw | %sR%s force Slurm | %s+/- %s log speed | %sg/G%s top/bottom | %sq%s quit\n" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET" \
-      "$BOLD" "$RESET"
+    print_row "Keys: Up/Down select | Enter details | Tab cycle | 1/2/3/4 views | l picker | p pause | r redraw | R refresh | +/- log | g/G top/bottom | q quit"
   fi
 
-  printf "%sLast log refresh:%s %s   %sLast Slurm refresh:%s %s\n" \
-    "$DIM" "$RESET" "$LAST_LOG_REFRESH" "$DIM" "$RESET" "$LAST_SLURM_REFRESH"
+  print_last_row "Last log refresh: %s   Last Slurm refresh: %s" \
+    "$LAST_LOG_REFRESH" "$LAST_SLURM_REFRESH"
 }
 
 render() {
   term_size
-  clear
+  printf '\033[H\033[2J'
 
   local usable_lines=$(( ROWS - 5 ))
   (( usable_lines < 8 )) && usable_lines=8
 
   local queue_lines
   queue_lines="$(queue_total_lines "$usable_lines")"
+
   local bottom_lines=$(( usable_lines - queue_lines ))
   (( bottom_lines < 5 )) && bottom_lines=5
 
